@@ -63,7 +63,8 @@ const LENS_PTR: usize = BFREQ_PTR + 0x500;
 const CTAB_PTR: usize = LENS_PTR + 0x1000;
 const HEAP_PTR: usize = CTAB_PTR + 0x50000; // ~0.32 MiB f64 cost tables
 const CLSYMS_PTR: usize = HEAP_PTR + 0x6000;
-const END_PTR: usize = CLSYMS_PTR + 0x4000;
+const SPLIT_PTR: usize = CLSYMS_PTR + 0x4000; // split-search scratch: 32 (token, cumBytes) pairs + 16 split byte positions
+const END_PTR: usize = SPLIT_PTR + 0x200;
 
 // --- DEFLATE tables (filled once by initTables)
 const LEN_BASE: i32[] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
@@ -424,10 +425,15 @@ function ensureTwoCodes(lenPtr: usize, n: i32): void {
 }
 
 // --- code-length RLE + dynamic header ---
-// Reads the lit/dist lengths, writes the RLE symbols as (sym, extra, extraBits)
-// triples to CL_SYM, the code-length code lengths to CL_TMP, and sets the
-// CL_HLIT / CL_HDIST / CL_NSYM globals.
-function encodeCodeLengths(litLenPtr: usize, distLenPtr: usize): void {
+// RLE variants for encoding the code-length array. zopfli tries several
+// encodings and keeps the smallest; we do the same, by exact bit cost.
+// Variant bits: 1 = use 16 for nonzero repeats, 2 = use 17 for zero runs
+// of 3..10, 4 = 16 only for repeats >= 4, 8 = use 18 for zero runs >= 11.
+// Variant 0 is the v2 greedy (all on, 16 from 3). All 16 are tried and the
+// cheapest exact header wins. Reads the lit/dist lengths, writes the RLE
+// symbols as (sym, extra, extraBits) triples to CL_SYM, the code-length
+// code lengths to CL_TMP, and sets the CL_HLIT / CL_HDIST / CL_NSYM globals.
+function encodeCodeLengths(litLenPtr: usize, distLenPtr: usize, variant: i32): void {
   let hlit = 288;
   let hdist = 32;
   while (hlit > 257 && load<u8>(litLenPtr + hlit - 1) == 0) hlit--;
@@ -435,6 +441,10 @@ function encodeCodeLengths(litLenPtr: usize, distLenPtr: usize): void {
   CL_HLIT = hlit;
   CL_HDIST = hdist;
   const total = hlit + hdist;
+  const use16 = (variant & 1) != 0;
+  const use17 = (variant & 2) != 0;
+  const min16 = (variant & 4) != 0 ? 4 : 3;
+  const use18 = (variant & 8) != 0;
   clWip = 0;
   let i = 0;
   while (i < total) {
@@ -446,19 +456,24 @@ function encodeCodeLengths(litLenPtr: usize, distLenPtr: usize): void {
         if (vv != 0) break;
         run++;
       }
-      while (run >= 11) {
-        const take = min(run, 138);
-        putSym(18, take - 11, 7);
-        i += take;
-        run -= take;
+      if (use18) {
+        while (run >= 11) {
+          const take = min(run, 138);
+          putSym(18, take - 11, 7);
+          i += take;
+          run -= take;
+        }
       }
-      if (run >= 3) {
-        putSym(17, run - 3, 3);
-        i += run;
-      } else {
-        for (let k = 0; k < run; k++) putSym(0, 0, 0);
-        i += run;
+      if (use17) {
+        while (run >= 3) {
+          const take = min(run, 10);
+          putSym(17, take - 3, 3);
+          i += take;
+          run -= take;
+        }
       }
+      for (let k = 0; k < run; k++) putSym(0, 0, 0);
+      i += run;
     } else {
       putSym(v, 0, 0);
       i++;
@@ -468,11 +483,13 @@ function encodeCodeLengths(litLenPtr: usize, distLenPtr: usize): void {
         if (vv != v) break;
         run++;
       }
-      while (run >= 3) {
-        const take = min(run, 6);
-        putSym(16, take - 3, 2);
-        i += take;
-        run -= take;
+      if (use16) {
+        while (run >= min16) {
+          const take = min(run, 6);
+          putSym(16, take - 3, 2);
+          i += take;
+          run -= take;
+        }
       }
       for (let k = 0; k < run; k++) {
         putSym(v, 0, 0);
@@ -490,9 +507,43 @@ function encodeCodeLengths(litLenPtr: usize, distLenPtr: usize): void {
   ensureTwoCodes(CL_TMP, 19);
 }
 
-/** Write a dynamic Huffman block header (HLIT/HDIST/HCLEN + code lengths). */
-function writeDynamicHeader(litLenPtr: usize, distLenPtr: usize): void {
-  encodeCodeLengths(litLenPtr, distLenPtr);
+/** Exact bit cost of the dynamic header for these lengths under `variant`
+ * (14 bits HLIT/HDIST/HCLEN + 3 bits per CL length + the RLE symbols). */
+function headerBitCost(litLenPtr: usize, distLenPtr: usize, variant: i32): i32 {
+  encodeCodeLengths(litLenPtr, distLenPtr, variant);
+  canonicalCodes(CL_TMP, 19, CL_CODE);
+  let hclen = 19;
+  while (hclen > 4 && load<u8>(CL_TMP + CL_ORDER[hclen - 1]) == 0) hclen--;
+  let bits = 5 + 5 + 4 + 3 * hclen;
+  for (let k = 0; k < CL_NSYM; k++) {
+    const s = load<i32>(CL_SYM + (k * 12));
+    const eb = load<i32>(CL_SYM + (k * 12) + 8);
+    bits += load<u8>(CL_TMP + s) + eb;
+  }
+  return bits;
+}
+
+let lastHeaderBits: i32 = 0;
+
+/** Best RLE variant by exact header cost. Leaves the best variant's
+ * encoding in CL_SYM/CL_TMP/CL_CODE so the header can be written from it. */
+function bestHeaderVariant(litLenPtr: usize, distLenPtr: usize): i32 {
+  let bestV = 0;
+  let bestC = 0x7fffffff;
+  for (let v = 0; v < 16; v++) {
+    const c = headerBitCost(litLenPtr, distLenPtr, v);
+    if (c < bestC) { bestC = c; bestV = v; }
+  }
+  lastHeaderBits = bestC;
+  encodeCodeLengths(litLenPtr, distLenPtr, bestV);
+  canonicalCodes(CL_TMP, 19, CL_CODE);
+  return bestV;
+}
+
+/** Write a dynamic Huffman block header (HLIT/HDIST/HCLEN + code lengths)
+ * with the given RLE variant. */
+function writeDynamicHeader(litLenPtr: usize, distLenPtr: usize, variant: i32): void {
+  encodeCodeLengths(litLenPtr, distLenPtr, variant);
   canonicalCodes(CL_TMP, 19, CL_CODE);
   let hclen = 19;
   while (hclen > 4 && load<u8>(CL_TMP + CL_ORDER[hclen - 1]) == 0) hclen--;
@@ -671,6 +722,7 @@ const LADDER: i32[] = [12, 16, 24, 32, 48, 64, 96, 128];
 
 let tokCount: i32 = 0; // tokens in TOKA/TOKB for the current pass
 let bestTokCount: i32 = 0; // tokens in BTOKA/BTOKB for the best pass
+let bestBits: f64 = Infinity; // token bits of the best pass (under its own Huffman)
 
 function buildCostTables(litLenPtr: usize, distLenPtr: usize): void {
   for (let i = 0; i < 286; i++) store<f64>(CT_LIT + (i << 3), load<u8>(litLenPtr + i));
@@ -693,9 +745,14 @@ function mergeLengths(refPtr: usize, fixPtr: usize, outPtr: usize, n: i32): void
 /**
  * Dynamic-programming optimal parse of one block. Fills TOKA/TOKB (tokens in
  * forward order), LFREQ/DFREQ, and returns the DP bit cost (cost[n]).
+ * candBase is the absolute position the candidate arrays are indexed from
+ * (the 200 KB block start); a part [bs, be) inside the block reads its
+ * candidates at offset bs - candBase, and matches are capped at the part
+ * end (a DEFLATE block's match may not cross its boundary).
  */
-function optimalParse(bs: i32, be: i32, litLenPtr: usize, distLenPtr: usize): f64 {
+function optimalParse(bs: i32, be: i32, litLenPtr: usize, distLenPtr: usize, candBase: i32): f64 {
   const n = be - bs;
+  const coff = bs - candBase; // candidate index offset for this part
   buildCostTables(litLenPtr, distLenPtr);
   for (let i = 0; i <= n; i++) store<f64>(COST_PTR + (i << 3), Infinity);
   store<f64>(COST_PTR, 0);
@@ -711,13 +768,14 @@ function optimalParse(bs: i32, be: i32, litLenPtr: usize, distLenPtr: usize): f6
       store<i32>(CDIST_PTR + ((i + 1) << 2), 0);
     }
     // Matches: for each candidate, a reduced set of lengths.
-    const cnt: i32 = load<u8>(CCNT_PTR + i);
+    const cnt: i32 = load<u8>(CCNT_PTR + i + coff);
     for (let k = 0; k < cnt; k++) {
-      const packed = load<i32>(CAND_PTR + ((i * CAND_CAP + k) << 2));
+      const packed = load<i32>(CAND_PTR + (((i + coff) * CAND_CAP + k) << 2));
       const L = packed >> 16;
       const D = packed & 0xffff;
+      const Lc = min(L, n - i); // cap the match at the part end
       const dc = load<f64>(CT_DIST + (D << 3));
-      for (let len = MIN_MATCH; len <= 8 && len <= L; len++) {
+      for (let len = MIN_MATCH; len <= 8 && len <= Lc; len++) {
         const nc = c + load<f64>(CT_LEN + (len << 3)) + dc;
         if (nc < load<f64>(COST_PTR + ((i + len) << 3))) {
           store<f64>(COST_PTR + ((i + len) << 3), nc);
@@ -727,7 +785,7 @@ function optimalParse(bs: i32, be: i32, litLenPtr: usize, distLenPtr: usize): f6
       }
       for (let q = 0; q < 8; q++) {
         const len = LADDER[q];
-        if (len > L) break;
+        if (len > Lc) break;
         const nc = c + load<f64>(CT_LEN + (len << 3)) + dc;
         if (nc < load<f64>(COST_PTR + ((i + len) << 3))) {
           store<f64>(COST_PTR + ((i + len) << 3), nc);
@@ -735,7 +793,7 @@ function optimalParse(bs: i32, be: i32, litLenPtr: usize, distLenPtr: usize): f6
           store<i32>(CDIST_PTR + ((i + len) << 2), D);
         }
       }
-      for (let len = max(9, L - 7); len <= L; len++) {
+      for (let len = max(9, Lc - 7); len <= Lc; len++) {
         if (len == 12 || len == 16 || len == 24 || len == 32 || len == 48 || len == 64 || len == 96 || len == 128) continue;
         const nc = c + load<f64>(CT_LEN + (len << 3)) + dc;
         if (nc < load<f64>(COST_PTR + ((i + len) << 3))) {
@@ -825,6 +883,112 @@ function emitTokens(tokAPtr: usize, tokBPtr: usize, count: i32, litCodesPtr: usi
   bwWrite(reverseBits(load<i32>(litCodesPtr + (256 << 2)), e), e);
 }
 
+// --- split-first block splitting (zopfli's structure, our own code) ---
+// A 200 KB block is first parsed GREEDILY (fixed costs), then split where
+// the split saves bits (each part gets its own Huffman tables + header),
+// and only then is each part parsed OPTIMALLY under its own cost model.
+// Splitting on the greedy tokens is what lets heterogeneous regions (dark
+// background vs noise thumbnails on i006) carry separate tables; the
+// optimal parse per part re-derives the tokens, so the split points only
+// need to be approximately right. All decisions are by exact measured
+// cost, deterministic (operation counts, never the clock).
+const SPLIT_QUANTUM: i32 = 8192; // split candidates at multiples of this many input bytes
+const SPLIT_MIN_PART: i32 = 8192; // a part must be at least this many input bytes
+// SPLIT_PTR layout: 32 (token, cumBytes) candidate pairs, then 16 split byte positions.
+const SPLIT_CAND: usize = SPLIT_PTR;
+const SPLIT_POS: usize = SPLIT_PTR + 256;
+
+let splitCount: i32 = 0; // split byte positions recorded in SPLIT_POS
+let bestSplitTok: i32 = -1; // token index of the best split found
+let bestSplitPos: i32 = -1; // byte position of the best split found
+
+/** Byte length of greedy token t (1 for a literal, the match length for a match). */
+function tokLen(t: i32): i32 {
+  const b = load<i32>(TOKB_PTR + (t << 2));
+  return b == 0 ? 1 : load<i32>(TOKA_PTR + (t << 2));
+}
+
+/** Bit cost of emitting greedy tokens [t0, t1) as ONE dynamic block: exact
+ * Huffman lengths from the tokens' frequencies + exact dynamic header
+ * (RLE variant 0 for search speed) + the end-of-block symbol. Uses
+ * LFREQ/DFREQ/LL_TMP/LL_TMPD scratch. */
+function partCost(t0: i32, t1: i32): i32 {
+  memory.fill(LFREQ, 0, 288 << 2);
+  memory.fill(DFREQ, 0, 32 << 2);
+  for (let t = t0; t < t1; t++) {
+    const a = load<i32>(TOKA_PTR + (t << 2));
+    const b = load<i32>(TOKB_PTR + (t << 2));
+    if (b == 0) {
+      store<i32>(LFREQ + (a << 2), load<i32>(LFREQ + (a << 2)) + 1);
+    } else {
+      store<i32>(LFREQ + (LEN_CODE[a] << 2), load<i32>(LFREQ + (LEN_CODE[a] << 2)) + 1);
+      store<i32>(DFREQ + (DIST_CODE[b] << 2), load<i32>(DFREQ + (DIST_CODE[b] << 2)) + 1);
+    }
+  }
+  store<i32>(LFREQ + (256 << 2), load<i32>(LFREQ + (256 << 2)) + 1); // end of block
+  huffLengths(LFREQ, 288, 15, LL_TMP);
+  huffLengths(DFREQ, 32, 15, LL_TMPD);
+  let hasDist = false;
+  for (let s = 0; s < 32; s++) {
+    if (load<i32>(DFREQ + (s << 2)) > 0) { hasDist = true; break; }
+  }
+  if (!hasDist) store<u8>(LL_TMPD, 1);
+  ensureTwoCodes(LL_TMP, 288);
+  ensureTwoCodes(LL_TMPD, 32);
+  let bits = 0;
+  for (let s = 0; s < 288; s++) bits += load<i32>(LFREQ + (s << 2)) * load<u8>(LL_TMP + s);
+  for (let s = 0; s < 32; s++) bits += load<i32>(DFREQ + (s << 2)) * load<u8>(LL_TMPD + s);
+  bestHeaderVariant(LL_TMP, LL_TMPD); // true header cost (best RLE variant)
+  bits += lastHeaderBits;
+  return bits;
+}
+
+/** Best single split of the greedy token range [t0, t1) (byte range starting
+ * at byte0). Candidates are token boundaries at multiples of
+ * SPLIT_QUANTUM bytes, at least SPLIT_MIN_PART bytes from both ends.
+ * Sets bestSplitTok/bestSplitPos; returns true when a split saves bits. */
+function findBestSplit(t0: i32, t1: i32, byte0: i32): bool {
+  let totalBytes = 0;
+  for (let t = t0; t < t1; t++) totalBytes += tokLen(t);
+  const baseCost = partCost(t0, t1);
+  let ncand = 0;
+  let cum = 0;
+  for (let t = t0; t < t1; t++) {
+    cum += tokLen(t);
+    if (t + 1 < t1 && cum >= SPLIT_MIN_PART && totalBytes - cum >= SPLIT_MIN_PART && (byte0 + cum) % SPLIT_QUANTUM == 0) {
+      if (ncand < 32) {
+        store<i32>(SPLIT_CAND + (ncand << 3), t + 1);
+        store<i32>(SPLIT_CAND + (ncand << 3) + 4, byte0 + cum);
+        ncand++;
+      }
+    }
+  }
+  let bestCost = baseCost;
+  bestSplitTok = -1;
+  bestSplitPos = -1;
+  for (let c = 0; c < ncand; c++) {
+    const s = load<i32>(SPLIT_CAND + (c << 3));
+    const bpos = load<i32>(SPLIT_CAND + (c << 3) + 4);
+    const cost = partCost(t0, s) + partCost(s, t1);
+    if (cost < bestCost) { bestCost = cost; bestSplitTok = s; bestSplitPos = bpos; }
+  }
+  return bestSplitTok >= 0;
+}
+
+/** Recursively split the greedy token range [t0, t1) (byte range starting
+ * at byte0); record split byte positions in SPLIT_POS. depth counts how
+ * many more splits are allowed on this path. */
+function collectSplits(t0: i32, t1: i32, byte0: i32, depth: i32): void {
+  if (depth <= 0) return;
+  if (!findBestSplit(t0, t1, byte0)) return;
+  const s = bestSplitTok;
+  const bp = bestSplitPos;
+  store<i32>(SPLIT_POS + (splitCount << 2), bp);
+  splitCount++;
+  collectSplits(t0, s, byte0, depth - 1);
+  collectSplits(s, t1, bp, depth - 1);
+}
+
 // --- driver + exports ---
 export function inputPtr(): usize {
   return IN_PTR;
@@ -902,22 +1066,107 @@ export function dbgParse(inLen: i32, bs: i32, be: i32, chain4Limit: i32, chain3L
   memory.fill(HEAD4_PTR, 0xff, HASH_SIZE << 2);
   encInserted = 0;
   findCandidates(IN_PTR, inLen, bs, be, chain4Limit, chain3Limit, maxCand);
-  dbgBitCost = optimalParse(bs, be, LL_FLIT, LL_FDIST);
+  dbgBitCost = optimalParse(bs, be, LL_FLIT, LL_FDIST, bs);
   return tokCount;
+}
+
+/** Run `nPasses` DP passes over [ps, pe) (candidates indexed from candBase).
+ * If `reset` is true, start from fixed costs with a fresh best; otherwise
+ * continue refining the current cost model and incumbent best (the DP loop
+ * resumed). The best pass's tokens/frequencies/lengths land in
+ * BTOKA/BTOKB/BLFREQ/BDFREQ/LL_BLIT/LL_BDIST, the count in bestTokCount,
+ * the token bits in bestBits. */
+function runDPPasses(ps: i32, pe: i32, candBase: i32, nPasses: i32, reset: bool): void {
+  if (reset) {
+    bestBits = Infinity;
+    bestTokCount = 0;
+    memory.copy(LL_CLIT, LL_FLIT, 288);
+    memory.copy(LL_CDIST, LL_FDIST, 32);
+  }
+  for (let pass = 0; pass < nPasses; pass++) {
+    optimalParse(ps, pe, LL_CLIT, LL_CDIST, candBase);
+    huffLengths(LFREQ, 288, 15, LL_TMP);
+    huffLengths(DFREQ, 32, 15, LL_TMPD);
+    // A dist alphabet with no matches needs one dummy code (never emitted).
+    let hasDist = false;
+    for (let s = 0; s < 32; s++) {
+      if (load<i32>(DFREQ + (s << 2)) > 0) {
+        hasDist = true;
+        break;
+      }
+    }
+    if (!hasDist) store<u8>(LL_TMPD, 1);
+    const bits = tokensBitCost(TOKA_PTR, TOKB_PTR, tokCount, LL_TMP, LL_TMPD);
+    if (bits < bestBits) {
+      bestBits = bits;
+      memory.copy(BTOKA_PTR, TOKA_PTR, tokCount << 2);
+      memory.copy(BTOKB_PTR, TOKB_PTR, tokCount << 2);
+      memory.copy(BLFREQ, LFREQ, 288 << 2);
+      memory.copy(BDFREQ, DFREQ, 32 << 2);
+      memory.copy(LL_BLIT, LL_TMP, 288);
+      memory.copy(LL_BDIST, LL_TMPD, 32);
+      bestTokCount = tokCount;
+    }
+    mergeLengths(LL_TMP, LL_FLIT, LL_CLIT, 288);
+    mergeLengths(LL_TMPD, LL_FDIST, LL_CDIST, 32);
+  }
+}
+
+/** Emit the current best pass (BTOKA/BTOKB) as one DEFLATE block, with the
+ * exact cheapest dynamic header (best RLE variant) or fixed Huffman,
+ * whichever is truly smaller. */
+function emitBestPart(lastPart: bool): void {
+  memory.copy(LL_LIT, LL_BLIT, 288);
+  memory.copy(LL_DIST, LL_BDIST, 32);
+  ensureTwoCodes(LL_LIT, 288);
+  ensureTwoCodes(LL_DIST, 32);
+  const bestV = bestHeaderVariant(LL_LIT, LL_DIST);
+  const headerBits = lastHeaderBits;
+  const dynBits = bestBits;
+  const fixBits = tokensBitCost(BTOKA_PTR, BTOKB_PTR, bestTokCount, LL_FLIT, LL_FDIST);
+  let dynamicValid = true;
+  for (let s = 0; s < 288; s++) {
+    if (load<i32>(BLFREQ + (s << 2)) > 0 && load<u8>(LL_LIT + s) == 0) dynamicValid = false;
+  }
+  for (let s = 0; s < 32; s++) {
+    if (load<i32>(BDFREQ + (s << 2)) > 0 && load<u8>(LL_DIST + s) == 0) dynamicValid = false;
+  }
+  const useDynamic = dynamicValid && dynBits + headerBits < fixBits;
+  bwWrite(lastPart ? 1 : 0, 1);
+  if (useDynamic) {
+    bwWrite(2, 2);
+    writeDynamicHeader(LL_LIT, LL_DIST, bestV);
+    canonicalCodes(LL_LIT, 288, LCODES);
+    canonicalCodes(LL_DIST, 32, DCODES);
+    emitTokens(BTOKA_PTR, BTOKB_PTR, bestTokCount, LCODES, LL_LIT, DCODES, LL_DIST);
+  } else {
+    bwWrite(1, 2);
+    canonicalCodes(LL_FLIT, 288, LCODES);
+    canonicalCodes(LL_FDIST, 32, DCODES);
+    emitTokens(BTOKA_PTR, BTOKB_PTR, bestTokCount, LCODES, LL_FLIT, DCODES, LL_FDIST);
+  }
 }
 
 /**
  * Deflate the filtered data already placed at IN_PTR (inLen bytes) into one
  * zlib stream at OUT_PTR. Returns the stream length, or -1 on bad parameters.
  * chain4Limit / chain3Limit / maxCand / dpPasses / blockSize are the search
- * configuration (v1.2 defaults: 1024 / 16 / 8 / 3 / 200000).
+ * configuration (v2 defaults: 1024 / 16 / 12 / 5 / 200000). maxParts caps
+ * the parts per 200 KB block (1 = v2 behaviour, no splitting; 4 = split
+ * into at most 4 parts, 8 = at most 8). Split-first: each 200 KB block is
+ * greedily parsed, split where it saves bits, then each part is optimally
+ * parsed under its own cost model and emitted as its own DEFLATE block
+ * with the exact cheapest dynamic header (best RLE variant) or fixed
+ * Huffman, whichever is truly smaller.
  */
-export function deflateAll(inLen: i32, chain4Limit: i32, chain3Limit: i32, maxCand: i32, dpPasses: i32, blockSize: i32): i32 {
+export function deflateAll(inLen: i32, chain4Limit: i32, chain3Limit: i32, maxCand: i32, dpPasses: i32, blockSize: i32, maxParts: i32): i32 {
   initTables();
   if (inLen < 0 || inLen > IN_MAX) return -1;
   if (blockSize < 1 || blockSize > BLOCK_CAP) return -1;
   if (maxCand < 1 || maxCand > CAND_CAP) return -1;
   if (dpPasses < 1 || dpPasses > 8) return -1;
+  if (maxParts < 1) maxParts = 1;
+  if (maxParts > 8) maxParts = 8;
   // Reset chains and bit writer.
   memory.fill(HEAD_PTR, 0xff, HASH_SIZE << 2);
   memory.fill(HEAD4_PTR, 0xff, HASH_SIZE << 2);
@@ -930,68 +1179,45 @@ export function deflateAll(inLen: i32, chain4Limit: i32, chain3Limit: i32, maxCa
   const n = inLen;
   for (let bs = 0; bs < n; bs += blockSize) {
     const be = min(n, bs + blockSize);
-    const last = be >= n;
+    const lastBlock = be >= n;
     findCandidates(IN_PTR, n, bs, be, chain4Limit, chain3Limit, maxCand);
-    // DP passes: fixed costs first, then refined lengths. Keep the best
-    // pass by its true cost under its own Huffman, not the last.
-    let bestBits: f64 = Infinity;
-    bestTokCount = 0;
-    memory.copy(LL_CLIT, LL_FLIT, 288);
-    memory.copy(LL_CDIST, LL_FDIST, 32);
-    for (let pass = 0; pass < dpPasses; pass++) {
-      optimalParse(bs, be, LL_CLIT, LL_CDIST);
-      huffLengths(LFREQ, 288, 15, LL_TMP);
-      huffLengths(DFREQ, 32, 15, LL_TMPD);
-      // A dist alphabet with no matches needs one dummy code (never emitted).
-      let hasDist = false;
-      for (let s = 0; s < 32; s++) {
-        if (load<i32>(DFREQ + (s << 2)) > 0) {
-          hasDist = true;
-          break;
+    // Search tokens: 2 DP passes over the whole block. Near-optimal tokens
+    // judge splits far better than a greedy parse (the greedy longest-match
+    // stream misjudges where a split pays). Copy them to TOKA/TOKB for the
+    // split search, then either finish the DP (no split) or re-parse per part.
+    const searchPasses = min(2, dpPasses);
+    runDPPasses(bs, be, bs, searchPasses, true);
+    memory.copy(TOKA_PTR, BTOKA_PTR, bestTokCount << 2);
+    memory.copy(TOKB_PTR, BTOKB_PTR, bestTokCount << 2);
+    const searchTokCount = bestTokCount;
+    splitCount = 0;
+    if (maxParts > 1) {
+      const depth = maxParts <= 2 ? 1 : maxParts <= 4 ? 2 : 3;
+      collectSplits(0, searchTokCount, bs, depth);
+      // Sort the split byte positions ascending (insertion sort, <= 7).
+      for (let a = 1; a < splitCount; a++) {
+        const v = load<i32>(SPLIT_POS + (a << 2));
+        let b = a - 1;
+        while (b >= 0 && load<i32>(SPLIT_POS + (b << 2)) > v) {
+          store<i32>(SPLIT_POS + ((b + 1) << 2), load<i32>(SPLIT_POS + (b << 2)));
+          b--;
         }
+        store<i32>(SPLIT_POS + ((b + 1) << 2), v);
       }
-      if (!hasDist) store<u8>(LL_TMPD, 1);
-      const bits = tokensBitCost(TOKA_PTR, TOKB_PTR, tokCount, LL_TMP, LL_TMPD);
-      if (bits < bestBits) {
-        bestBits = bits;
-        memory.copy(BTOKA_PTR, TOKA_PTR, tokCount << 2);
-        memory.copy(BTOKB_PTR, TOKB_PTR, tokCount << 2);
-        memory.copy(BLFREQ, LFREQ, 288 << 2);
-        memory.copy(BDFREQ, DFREQ, 32 << 2);
-        memory.copy(LL_BLIT, LL_TMP, 288);
-        memory.copy(LL_BDIST, LL_TMPD, 32);
-        bestTokCount = tokCount;
-      }
-      mergeLengths(LL_TMP, LL_FLIT, LL_CLIT, 288);
-      mergeLengths(LL_TMPD, LL_FDIST, LL_CDIST, 32);
     }
-    memory.copy(LL_LIT, LL_BLIT, 288);
-    memory.copy(LL_DIST, LL_BDIST, 32);
-    ensureTwoCodes(LL_LIT, 288);
-    ensureTwoCodes(LL_DIST, 32);
-    // Choose dynamic vs fixed Huffman for this block.
-    const dynBits = bestBits;
-    const fixBits = tokensBitCost(BTOKA_PTR, BTOKB_PTR, bestTokCount, LL_FLIT, LL_FDIST);
-    let dynamicValid = true;
-    for (let s = 0; s < 288; s++) {
-      if (load<i32>(BLFREQ + (s << 2)) > 0 && load<u8>(LL_LIT + s) == 0) dynamicValid = false;
+    if (splitCount == 0) {
+      // No split: finish the DP (remaining passes) and emit the whole block.
+      runDPPasses(bs, be, bs, dpPasses - searchPasses, false);
+      emitBestPart(lastBlock);
+      continue;
     }
-    for (let s = 0; s < 32; s++) {
-      if (load<i32>(BDFREQ + (s << 2)) > 0 && load<u8>(LL_DIST + s) == 0) dynamicValid = false;
-    }
-    const useDynamic = dynamicValid && dynBits + 400 < fixBits;
-    bwWrite(last ? 1 : 0, 1);
-    if (useDynamic) {
-      bwWrite(2, 2);
-      writeDynamicHeader(LL_LIT, LL_DIST);
-      canonicalCodes(LL_LIT, 288, LCODES);
-      canonicalCodes(LL_DIST, 32, DCODES);
-      emitTokens(BTOKA_PTR, BTOKB_PTR, bestTokCount, LCODES, LL_LIT, DCODES, LL_DIST);
-    } else {
-      bwWrite(1, 2);
-      canonicalCodes(LL_FLIT, 288, LCODES);
-      canonicalCodes(LL_FDIST, 32, DCODES);
-      emitTokens(BTOKA_PTR, BTOKB_PTR, bestTokCount, LCODES, LL_FLIT, DCODES, LL_FDIST);
+    const nparts = splitCount + 1;
+    for (let pi = 0; pi < nparts; pi++) {
+      const ps = pi == 0 ? bs : load<i32>(SPLIT_POS + ((pi - 1) << 2));
+      const pe = pi < splitCount ? load<i32>(SPLIT_POS + (pi << 2)) : be;
+      const lastPart = lastBlock && pi == nparts - 1;
+      runDPPasses(ps, pe, bs, dpPasses, true);
+      emitBestPart(lastPart);
     }
   }
   const body = bwFinish();
