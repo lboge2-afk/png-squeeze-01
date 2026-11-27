@@ -28,7 +28,7 @@ import { deflateSync, inflateSync } from 'node:zlib';
 import { decodePng, ihdrOf, pngOf } from './png.mjs';
 import { screenCandidates } from './screen.mjs';
 import { deflate } from './deflate.mjs';
-import { deflateWasm } from './deflate-wasm.mjs';
+import { deflateWasm, wasmConfigFor } from './deflate-wasm.mjs';
 import { findTopBand } from './band.mjs';
 
 const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
@@ -55,7 +55,10 @@ for (const id of readdirSync(I).sort()) {
   const band = findTopBand(best, image.width, image.height);
   if (band !== null) best = { form: best.form, choice: `band-f${band.filter}@${band.boundary}`, data: band.data, bytes: band.zlibLen, zlibLen: band.zlibLen };
   // Optimal-parse deflate: WASM core first, JS fallback on any failure.
-  let optimal = deflateWasm(best.data);
+  // The search tier is picked per instance from the measured sizes (the
+  // points-per-byte allocation: deep search on small outputs, cheap search
+  // on the big ones). Deterministic: sizes only, no clock.
+  let optimal = deflateWasm(best.data, wasmConfigFor(best.data.length, best.zlibLen));
   if (optimal !== null) {
     // Round-trip check: the WASM stream must inflate back to the input.
     let ok = false;
