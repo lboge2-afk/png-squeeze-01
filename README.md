@@ -24,6 +24,21 @@ that build). The WASM core buys a deeper search (two-level hash, MAX_CAND
 12, 5 DP passes) inside the 60 s wall; the pure-JS `deflate.mjs` stays as
 a fallback, and every WASM stream is round-trip checked before use.
 
+v2.1 (grade-local 763,178, +2,048 over v2): the WASM core now optimises
+the Huffman header (16 RLE variants for the code-length table, exact
+dynamic-vs-fixed choice instead of a +400 heuristic) and splits blocks
+by measured cost — a cost-based recursive split search over near-optimal
+tokens (2 DP passes), not a greedy parse (the greedy tokens misjudge
+splits and the first version lost 4,336 points). And the search is
+allocated per instance by the points-per-byte rule (see `WASM_TIERS` in
+`deflate-wasm.mjs`): bytes are worth ~14x more on the smallest outputs
+than on the biggest, so flat/small outputs get the deep search (chain4
+4096, 8 DP passes) and the big ones run cheaper (chain4 768, 4 passes).
+The tier is picked from the measured sizes only (filtered length +
+zlib-6 baseline length) — deterministic, no clock. Standalone wall
+~56 s on the practice set (two runs byte-identical); the 60 s wall is
+the binding constraint, so the allocation is deliberately time-neutral.
+
 Deterministic: fixed iteration counts and block sizes, no clock, no
 randomness, no network. Two runs produce byte-identical outputs.
 
