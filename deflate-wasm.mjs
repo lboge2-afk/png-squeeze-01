@@ -2,23 +2,60 @@
 // base64 blob in wasm-b64.mjs (compiled from deflate.ts, our own
 // AssemblyScript port of deflate.mjs). Same search as the JS deflate, but
 // the chain-walking hot loop runs at near-native speed, which buys the
-// deeper search the JS version cannot afford inside the 60 s wall:
-// two-level hash (chain4 1024, chain3 16), MAX_CAND 12, 5 DP passes,
-// 200 KB blocks. Deterministic: fixed iteration counts, operation-counted
-// budgets, no clock, no randomness. If the WASM cannot load or returns an
-// error, deflateWasm returns null and the caller falls back to the JS
-// deflate in deflate.mjs.
+// deeper search the JS version cannot afford inside the 60 s wall.
+// v2.1: the core now also optimises the Huffman header (16 RLE variants +
+// exact dynamic-vs-fixed choice) and splits blocks by measured cost
+// (near-optimal search tokens, not a greedy parse). Deterministic: fixed
+// iteration counts, operation-counted budgets, no clock, no randomness.
+// If the WASM cannot load or returns an error, deflateWasm returns null
+// and the caller falls back to the JS deflate in deflate.mjs.
 
 import { WASM_B64 } from './wasm-b64.mjs';
 
-/** The search configuration (matches the measured sweep: I = dpPasses 5 + maxCand 12). */
+/** The default search configuration (v2: I = dpPasses 5 + maxCand 12). */
 export const WASM_CONFIG = Object.freeze({
   chain4Limit: 1024,
   chain3Limit: 16,
   maxCand: 12,
   dpPasses: 5,
   blockSize: 200000,
+  maxParts: 4,
 });
+
+/**
+ * Per-instance search tiers (v2.1, measured on the practice set). Bytes are
+ * worth ~14x more on the smallest outputs than on the biggest instance, so
+ * the deep search goes to small outputs and the big ones run cheaper. The
+ * tier is picked from the measured sizes only (filtered length + zlib-6
+ * baseline length) — deterministic, no clock. maxCand 16 is free everywhere.
+ * DEEP: tiny output (zlib-6 <22 KB) — flat, deep search is cheap and pays most.
+ * MED: small output (16–30 KB) — chain4 2048 + 8 DP passes.
+ * STD_DP8: medium output, medium stream — 8 DP passes.
+ * STD: the alpha instance whose output is small but whose matches are
+ * sparse — full search, cheapening it loses ~12 points.
+ * MILD_CHEAP: big output (97–168 KB) — chain4 768 + 4 passes: ~1–2 s
+ * faster, loses <1 point (on the alpha instance it even gains a little).
+ * Never chain4 2048 on the biggest/noisiest instance — it loses bytes.
+ */
+export const WASM_TIERS = Object.freeze({
+  DEEP: Object.freeze({ chain4Limit: 4096, chain3Limit: 16, maxCand: 16, dpPasses: 8, blockSize: 200000, maxParts: 4 }),
+  MED: Object.freeze({ chain4Limit: 2048, chain3Limit: 16, maxCand: 16, dpPasses: 8, blockSize: 200000, maxParts: 4 }),
+  STD_DP8: Object.freeze({ chain4Limit: 1024, chain3Limit: 16, maxCand: 16, dpPasses: 8, blockSize: 200000, maxParts: 4 }),
+  STD: Object.freeze({ chain4Limit: 1024, chain3Limit: 16, maxCand: 16, dpPasses: 5, blockSize: 200000, maxParts: 4 }),
+  MILD_CHEAP: Object.freeze({ chain4Limit: 768, chain3Limit: 16, maxCand: 16, dpPasses: 4, blockSize: 200000, maxParts: 4 }),
+});
+
+/** Pick a search tier from the instance's measured sizes (see WASM_TIERS).
+ * NOTE: zlibLen here is the zlib-6 baseline length, which runs ~15–25%
+ * larger than our WASM deflate length, so the thresholds are set against
+ * zlib-6 lengths (flat i005 measures 18,540, not 15,064). */
+export function wasmConfigFor(dataLen, zlibLen) {
+  if (zlibLen < 22000) return WASM_TIERS.DEEP;
+  if (zlibLen < 30000) return WASM_TIERS.MED;
+  if (dataLen >= 3000000) return zlibLen >= 70000 ? WASM_TIERS.MILD_CHEAP : WASM_TIERS.STD;
+  if (dataLen >= 2000000) return zlibLen >= 100000 ? WASM_TIERS.MILD_CHEAP : WASM_TIERS.STD_DP8;
+  return WASM_TIERS.MILD_CHEAP;
+}
 
 let wasm = null; // { deflateAll, inputPtr, outputPtr, memory } | false (failed)
 let tried = false;
@@ -43,13 +80,16 @@ function init() {
 }
 
 /**
- * Deflate `data` with the WASM core. Returns the zlib stream (Uint8Array)
- * or null when the WASM is unavailable or reports an error. The caller
- * round-trips the result and falls back to the JS deflate on any failure.
+ * Deflate `data` with the WASM core. `config` is an optional search tier
+ * (see wasmConfigFor); when omitted the default WASM_CONFIG is used.
+ * Returns the zlib stream (Uint8Array) or null when the WASM is unavailable
+ * or reports an error. The caller round-trips the result and falls back to
+ * the JS deflate on any failure.
  */
-export function deflateWasm(data) {
+export function deflateWasm(data, config) {
   const w = init();
   if (!w) return null;
+  const cfg = config || WASM_CONFIG;
   try {
     const mem = new Uint8Array(w.memory.buffer);
     const inPtr = w.inputPtr();
@@ -57,11 +97,12 @@ export function deflateWasm(data) {
     mem.set(data, inPtr);
     const outLen = w.deflateAll(
       data.length,
-      WASM_CONFIG.chain4Limit,
-      WASM_CONFIG.chain3Limit,
-      WASM_CONFIG.maxCand,
-      WASM_CONFIG.dpPasses,
-      WASM_CONFIG.blockSize,
+      cfg.chain4Limit,
+      cfg.chain3Limit,
+      cfg.maxCand,
+      cfg.dpPasses,
+      cfg.blockSize,
+      cfg.maxParts,
     );
     if (outLen < 0 || outLen > data.length + 1024) return null;
     const outPtr = w.outputPtr();
