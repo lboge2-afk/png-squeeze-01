@@ -273,8 +273,12 @@ const HASH_SIZE = 1 << HASH_BITS;
 const HASH_MASK = HASH_SIZE - 1;
 /** How many chain entries a position's match search walks at most. */
 const CHAIN_LIMIT = 256;
+/** Chain limit for the 4-byte hash walk (long matches). */
+const CHAIN4_LIMIT = 1024;
+/** Chain limit for the 3-byte hash walk (short matches only). */
+const CHAIN3_LIMIT = 16;
 /** How many distinct-distance candidates a position keeps. */
-const MAX_CAND = 4;
+const MAX_CAND = 8;
 /** Block size for the deflate stream (bytes of filtered data). */
 const BLOCK_SIZE = 200000;
 /** DP passes: pass 0 uses fixed-Huffman costs, later passes refine. */
@@ -282,6 +286,9 @@ const DP_PASSES = 3;
 
 function hash3(d, i) {
   return ((d[i] << 10) ^ (d[i + 1] << 5) ^ d[i + 2]) & HASH_MASK;
+}
+function hash4(d, i) {
+  return ((d[i] << 15) ^ (d[i + 1] << 10) ^ (d[i + 2] << 5) ^ d[i + 3]) & HASH_MASK;
 }
 
 /** Match length of data[j..] vs data[i..], capped at `cap`. Verifies all bytes
@@ -305,17 +312,24 @@ export class BlockEncoder {
     this.d = data;
     this.head = new Int32Array(HASH_SIZE).fill(-1);
     this.prev = new Int32Array(data.length).fill(-1);
+    this.head4 = new Int32Array(HASH_SIZE).fill(-1);
+    this.prev4 = new Int32Array(data.length).fill(-1);
     this.insertedUpTo = 0;
   }
 
   /** Insert positions [from, to) into the hash chains. */
   insertRange(from, to) {
-    const { d, head, prev } = this;
+    const { d, head, prev, head4, prev4 } = this;
     for (let i = from; i < to; i++) {
       if (i + 2 >= d.length) break;
       const h = hash3(d, i);
       prev[i] = head[h];
       head[h] = i;
+      if (i + 3 < d.length) {
+        const h4 = hash4(d, i);
+        prev4[i] = head4[h4];
+        head4[h4] = i;
+      }
     }
     this.insertedUpTo = Math.max(this.insertedUpTo, to);
   }
@@ -326,8 +340,10 @@ export class BlockEncoder {
    * Returns {candLen, candDist, candCount} flat arrays (n x MAX_CAND).
    */
   findCandidates(bs, be) {
-    const { d, head, prev } = this;
+    const { d, head, prev, head4, prev4 } = this;
     const n = be - bs;
+    const dists = new Int32Array(64);
+    const lens = new Uint16Array(64);
     const candLen = new Uint16Array(n * MAX_CAND);
     const candDist = new Uint16Array(n * MAX_CAND);
     const candCount = new Uint8Array(n);
@@ -336,51 +352,81 @@ export class BlockEncoder {
     for (let i = bs; i < be; i++) {
       const p = i - bs;
       if (i + 2 < d.length && be - i >= MIN_MATCH) {
-        const h = hash3(d, i);
         const cap = Math.min(MAX_MATCH, be - i);
-        let j = head[h];
-        let steps = 0;
         let best = 0, bestDist = 0;
         // Pareto-optimal candidates: each beats every earlier one in length,
         // at increasing distance (the chain runs newest-first). A candidate
         // that cannot beat `best` is dominated, so one probe byte rejects it.
-        const dists = [];
-        const lens = [];
-        while (j >= 0 && steps < CHAIN_LIMIT) {
-          const dist = i - j;
-          if (dist > WINDOW) break;
-          let len = 0;
-          if (best === 0) {
-            // Verify the first 3 bytes (the hash can collide), then measure.
-            if (d[j] === d[i] && d[j + 1] === d[i + 1] && d[j + 2] === d[i + 2]) {
+        // dists/lens are scratch arrays reused across positions (counted by pcnt).
+        let pcnt = 0;
+        // Walk 1: the 4-byte hash chain — long matches. Its buckets are far
+        // shorter than the 3-byte ones in varied data, so a deep walk is
+        // cheap here; it finds every match of length >= 4.
+        if (i + 3 < d.length) {
+          const h4 = hash4(d, i);
+          let j = head4[h4];
+          let steps = 0;
+          while (j >= 0 && steps < CHAIN4_LIMIT) {
+            const dist = i - j;
+            if (dist > WINDOW) break;
+            let len = 0;
+            if (best === 0) {
+              if (d[j] === d[i] && d[j + 1] === d[i + 1] && d[j + 2] === d[i + 2] && d[j + 3] === d[i + 3]) {
+                len = matchLen(d, i, j, cap);
+              }
+            } else if (best < cap && d[j + best] === d[i + best]) {
               len = matchLen(d, i, j, cap);
             }
-          } else if (best < cap && d[j + best] === d[i + best]) {
-            len = matchLen(d, i, j, cap);
+            if (len >= MIN_MATCH && len > best) {
+              best = len;
+              bestDist = dist;
+              dists[pcnt] = dist;
+              lens[pcnt] = len;
+              pcnt++;
+              if (best >= 128) break;
+            }
+            j = prev4[j];
+            steps++;
           }
-          if (len >= MIN_MATCH && len > best) {
-            best = len;
-            bestDist = dist;
-            dists.push(dist);
-            lens.push(len);
-            if (best >= 128) break;
+        }
+        // Walk 2: the 3-byte hash chain, short limit — the exactly-3-byte
+        // matches the 4-byte walk cannot see, plus near short matches.
+        {
+          const h = hash3(d, i);
+          let j = head[h];
+          let steps = 0;
+          while (j >= 0 && steps < CHAIN3_LIMIT) {
+            const dist = i - j;
+            if (dist > WINDOW) break;
+            let len = 0;
+            if (best === 0) {
+              if (d[j] === d[i] && d[j + 1] === d[i + 1] && d[j + 2] === d[i + 2]) {
+                len = matchLen(d, i, j, cap);
+              }
+            } else if (best < cap && d[j + best] === d[i + best]) {
+              len = matchLen(d, i, j, cap);
+            }
+            if (len >= MIN_MATCH && len > best) {
+              best = len;
+              bestDist = dist;
+              dists[pcnt] = dist;
+              lens[pcnt] = len;
+              pcnt++;
+              if (best >= 128) break;
+            }
+            j = prev[j];
+            steps++;
           }
-          j = prev[j];
-          steps++;
-          // Diminishing returns: a long walk that only finds short matches
-          // is unlikely to pay off, so stop early (zlib's good_match idea).
-          if (steps >= 256 && best < 32) break;
-          if (steps >= 64 && best < 8) break;
         }
         // Store candidates: the first (nearest) plus the longest ones.
         // `lens` is strictly increasing (Pareto), so the longest are last.
         // The DP wants both a cheap near match and the longest matches.
         let cnt = 0;
-        if (lens.length > 0) {
+        if (pcnt > 0) {
           candLen[p * MAX_CAND + cnt] = lens[0];
           candDist[p * MAX_CAND + cnt] = dists[0];
           cnt++;
-          for (let k = lens.length - 1; k >= 1 && cnt < MAX_CAND; k--) {
+          for (let k = pcnt - 1; k >= 1 && cnt < MAX_CAND; k--) {
             candLen[p * MAX_CAND + cnt] = lens[k];
             candDist[p * MAX_CAND + cnt] = dists[k];
             cnt++;
@@ -393,6 +439,11 @@ export class BlockEncoder {
         const h = hash3(d, i);
         prev[i] = head[h];
         head[h] = i;
+        if (i + 3 < d.length) {
+          const h4 = hash4(d, i);
+          prev4[i] = head4[h4];
+          head4[h4] = i;
+        }
       }
     }
     this.insertedUpTo = Math.max(this.insertedUpTo, be);
@@ -445,9 +496,20 @@ export function optimalParse(d, bs, be, cands, litLen, distLen) {
       const L = candLen[i * MAX_CAND + k];
       const D = candDist[i * MAX_CAND + k];
       const dc = distCost[D];
-      // Lengths: 3..min(L,8) and L-7..L (deduped), all within [3, L].
-      const hi = Math.min(L, 8);
-      for (let len = MIN_MATCH; len <= hi; len++) {
+      // Lengths: 3..8, a geometric ladder, then L-7..L (ladder values
+      // skipped in the tail — they were already tried).
+      for (let len = MIN_MATCH; len <= 8 && len <= L; len++) {
+        const nc = c + lenCost[len] + dc;
+        if (nc < cost[i + len]) {
+          cost[i + len] = nc;
+          choiceLen[i + len] = len;
+          choiceDist[i + len] = D;
+        }
+      }
+      const ladder = [12, 16, 24, 32, 48, 64, 96, 128];
+      for (let q = 0; q < ladder.length; q++) {
+        const len = ladder[q];
+        if (len > L) break;
         const nc = c + lenCost[len] + dc;
         if (nc < cost[i + len]) {
           cost[i + len] = nc;
@@ -456,6 +518,7 @@ export function optimalParse(d, bs, be, cands, litLen, distLen) {
         }
       }
       for (let len = Math.max(9, L - 7); len <= L; len++) {
+        if (len === 12 || len === 16 || len === 24 || len === 32 || len === 48 || len === 64 || len === 96 || len === 128) continue;
         const nc = c + lenCost[len] + dc;
         if (nc < cost[i + len]) {
           cost[i + len] = nc;
