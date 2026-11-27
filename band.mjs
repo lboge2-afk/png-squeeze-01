@@ -68,9 +68,14 @@ export function findTopBand(winner, width, height) {
     if (rough[b] > SMOOTH_THRESHOLD) { B0 = b * 20; break; }
   }
   if (B0 < MIN_TOP || B0 >= height) return null;
+  // Wall safety (v2.2): the boundary grid is coarse (40-row steps, not 20)
+  // because each candidate costs a full zlib-6 pass over the whole stream
+  // and the band is a coarse optimisation — being within 40 rows of the
+  // true boundary keeps essentially all of the benefit. 8 zlib calls
+  // max (was 16); on hard draws the 16-call grid alone cost ~11 s.
   let best = null;
   for (const topFilter of [2, 4]) {
-    for (let B = Math.max(MIN_TOP, B0 - 20); B <= Math.min(height, B0 + 120); B += 20) {
+    for (let B = Math.max(MIN_TOP, B0 - 20); B <= Math.min(height, B0 + 120); B += 40) {
       const data = bandedData(winner.data, form.samples, width, height, form.bpp, topFilter, B);
       const zlibLen = deflateSync(data, { level: 6, memLevel: 8 }).length;
       if (zlibLen < winner.zlibLen - ACCEPT_MARGIN && (best === null || zlibLen < best.zlibLen)) {
