@@ -28,9 +28,13 @@ export const WASM_CONFIG = Object.freeze({
  * the deep search goes to small outputs and the big ones run cheaper. The
  * tier is picked from the measured sizes only (filtered length + zlib-6
  * baseline length) — deterministic, no clock. maxCand 16 is free everywhere.
- * DEEP: tiny output (zlib-6 <22 KB) — flat, deep search is cheap and pays most.
- * MED: small output (16–30 KB) — chain4 2048 + 8 DP passes.
- * STD_DP8: medium output, medium stream — 8 DP passes.
+ * DEEP: tiny output (zlib-6 <22 KB) — flat. v2.3: chain4 capped at 1024
+ * (the 2048/4096 chains are what blow the wall on repetitive flat
+ * content — seed1's flat i001 took 12.2 s at chain4 4096); the deep
+ * search now buys only the extra DP pass (6 vs 5) and maxCand 16.
+ * MED: small output (22–30 KB) — chain4 1024, 5 passes.
+ * STD_DP8: medium output, medium stream — 5 passes (same as STD now;
+ * the extra passes did not pay for their wall on hard draws).
  * STD: the alpha instance whose output is small but whose matches are
  * sparse — full search, cheapening it loses ~12 points.
  * MILD_CHEAP: big output (97–168 KB) — chain4 768 + 4 passes: ~1–2 s
@@ -38,11 +42,16 @@ export const WASM_CONFIG = Object.freeze({
  * Never chain4 2048 on the biggest/noisiest instance — it loses bytes.
  */
 export const WASM_TIERS = Object.freeze({
-  DEEP: Object.freeze({ chain4Limit: 4096, chain3Limit: 16, maxCand: 16, dpPasses: 8, blockSize: 200000, maxParts: 4 }),
-  MED: Object.freeze({ chain4Limit: 2048, chain3Limit: 16, maxCand: 16, dpPasses: 8, blockSize: 200000, maxParts: 4 }),
-  STD_DP8: Object.freeze({ chain4Limit: 1024, chain3Limit: 16, maxCand: 16, dpPasses: 8, blockSize: 200000, maxParts: 4 }),
-  STD: Object.freeze({ chain4Limit: 1024, chain3Limit: 16, maxCand: 16, dpPasses: 5, blockSize: 200000, maxParts: 4 }),
-  MILD_CHEAP: Object.freeze({ chain4Limit: 768, chain3Limit: 16, maxCand: 16, dpPasses: 4, blockSize: 200000, maxParts: 4 }),
+  DEEP: Object.freeze({ chain4Limit: 1024, chain3Limit: 16, maxCand: 16, dpPasses: 6, blockSize: 200000, maxParts: 4 }),
+  MED: Object.freeze({ chain4Limit: 1024, chain3Limit: 16, maxCand: 16, dpPasses: 5, blockSize: 200000, maxParts: 4 }),
+  STD_DP8: Object.freeze({ chain4Limit: 1024, chain3Limit: 16, maxCand: 16, dpPasses: 4, blockSize: 200000, maxParts: 4 }),
+  STD: Object.freeze({ chain4Limit: 1024, chain3Limit: 16, maxCand: 16, dpPasses: 4, blockSize: 200000, maxParts: 4 }),
+  MILD_CHEAP: Object.freeze({ chain4Limit: 768, chain3Limit: 16, maxCand: 16, dpPasses: 3, blockSize: 200000, maxParts: 4 }),
+  // Huge output (zlib-6 >= 300 KB): the slowest instances (seed2's i002/
+  // i006 take 6–11 s even at CHEAP) and the cheapest bytes (0.45 pts/B).
+  // chain4 512 + 2 passes: the wall saving is worth more than the few
+  // points these bytes are worth.
+  CHEAPEST: Object.freeze({ chain4Limit: 512, chain3Limit: 16, maxCand: 12, dpPasses: 2, blockSize: 200000, maxParts: 4 }),
 });
 
 /** Pick a search tier from the instance's measured sizes (see WASM_TIERS).
@@ -50,6 +59,7 @@ export const WASM_TIERS = Object.freeze({
  * larger than our WASM deflate length, so the thresholds are set against
  * zlib-6 lengths (flat i005 measures 18,540, not 15,064). */
 export function wasmConfigFor(dataLen, zlibLen) {
+  if (zlibLen >= 300000) return WASM_TIERS.CHEAPEST;
   if (zlibLen < 22000) return WASM_TIERS.DEEP;
   if (zlibLen < 30000) return WASM_TIERS.MED;
   if (dataLen >= 3000000) return zlibLen >= 70000 ? WASM_TIERS.MILD_CHEAP : WASM_TIERS.STD;
