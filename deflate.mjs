@@ -272,7 +272,7 @@ const HASH_BITS = 18;
 const HASH_SIZE = 1 << HASH_BITS;
 const HASH_MASK = HASH_SIZE - 1;
 /** How many chain entries a position's match search walks at most. */
-const CHAIN_LIMIT = 512;
+const CHAIN_LIMIT = 256;
 /** How many distinct-distance candidates a position keeps. */
 const MAX_CAND = 4;
 /** Block size for the deflate stream (bytes of filtered data). */
